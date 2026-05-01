@@ -1409,6 +1409,7 @@
 
     // --- Minify ---
     let minIcon = null;
+    let lastRestoreAt = 0;
     function createMinIcon() {
       const rect = box.getBoundingClientRect();
       const icon = document.createElement("div");
@@ -1429,7 +1430,9 @@
       icon.innerText = "\u2709";
       document.body.appendChild(icon);
       registerEl(icon);
-      icon.onclick = () => {
+      icon.onclick = (ev) => {
+        if (ev) { ev.preventDefault(); ev.stopPropagation(); }
+        lastRestoreAt = Date.now();
         removeEl(icon); minIcon = null;
         box.style.display = "flex";
         chatController.resume();
@@ -1446,7 +1449,10 @@
       chatController.pause();
     }
 
-    minifyBtn.onclick = () => minifyChat();
+    minifyBtn.onclick = () => {
+      if (Date.now() - lastRestoreAt < 300) return;
+      minifyChat();
+    };
 
     closeBtn.onclick = () => {
       if (box._chatController) try { box._chatController.stop(); } catch (e) {}
@@ -2180,10 +2186,10 @@
 
       async function connectWs() {
         if (!wsActive || wsPaused) return;
+        if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
 
-        // Close the old socket before opening a new one.
-        // Without this, the DO holds both connections and broadcasts to all of them.
-        if (ws) {
+        // Close stale sockets before opening a new one.
+        if (ws && ws.readyState !== WebSocket.CLOSED) {
           try { ws.close(1000, "reconnecting"); } catch (e) {}
           ws = null;
         }
@@ -2219,6 +2225,18 @@
 
       function sendWs(data) {
         if (ws && ws.readyState === WebSocket.OPEN) { ws.send(JSON.stringify(data)); return true; }
+        return false;
+      }
+
+      async function sendWsReliable(data, timeoutMs = 3000) {
+        if (sendWs(data)) return true;
+        if (!wsActive || wsPaused) return false;
+        connectWs();
+        const start = Date.now();
+        while (Date.now() - start < timeoutMs) {
+          if (sendWs(data)) return true;
+          await new Promise(r => setTimeout(r, 120));
+        }
         return false;
       }
 
@@ -2415,7 +2433,7 @@
           _localStream.getTracks().forEach(t => peerConnection.addTrack(t, _localStream));
           const offer = await peerConnection.createOffer();
           await peerConnection.setLocalDescription(offer);
-          sendWs({ type: "call-offer", to: targetUsername, sdp: offer.sdp });
+          if (!(await sendWsReliable({ type: "call-offer", to: targetUsername, sdp: offer.sdp }))) throw new Error("Call signaling unavailable");
           showCallWindow(targetUsername, _localStream);
           minifyChat();
         } catch (e) { console.error("startCall error", e); endCall("error"); }
@@ -2442,7 +2460,7 @@
 
           const answer = await peerConnection.createAnswer();
           await peerConnection.setLocalDescription(answer);
-          sendWs({ type: "call-answer", to: callPeer, sdp: answer.sdp });
+          if (!(await sendWsReliable({ type: "call-answer", to: callPeer, sdp: answer.sdp }))) throw new Error("Call signaling unavailable");
           callState = "active";
           pendingOffer = null;
         } catch (e) { console.error("acceptCall error", e); endCall("error"); }
@@ -2492,8 +2510,8 @@
           showGroupCallWindow();
           minifyChat();
           activeGroupCallMembers.add(username);
-          sendWs({ type: "call-group-invite", members: [...activeGroupCallMembers] });
-          sendWs({ type: "call-group-announce", members: [...activeGroupCallMembers] });
+          if (!(await sendWsReliable({ type: "call-group-invite", members: [...activeGroupCallMembers] }))) throw new Error("Call signaling unavailable");
+          if (!(await sendWsReliable({ type: "call-group-announce", members: [...activeGroupCallMembers] }))) throw new Error("Call signaling unavailable");
           // Beacon every 8s so late-joiners see the call in the panel
           groupAnnounceTimer = setInterval(() => {
             if (callState === "active-group") {
@@ -2521,7 +2539,7 @@
           showGroupCallWindow();
           minifyChat();
           activeGroupCallMembers.add(username);
-          sendWs({ type: "call-group-join" }); // everyone in the call hears this and connects
+          if (!(await sendWsReliable({ type: "call-group-join" }))) throw new Error("Call signaling unavailable"); // everyone in the call hears this and connects
           for (const member of existingMembers) {
             await handleNewGroupMember(member);
           }
